@@ -1,4 +1,3 @@
-
 import json
 import hashlib
 import os
@@ -8,7 +7,7 @@ import time
 from pathlib import Path
 
 # =======================
-# CONFIGURAÇÕES (ajuste se necessário)
+# CONFIGURAÇÕES
 # =======================
 CONTAINER_NAME = "oracle-free"
 IMAGE = "gvenzl/oracle-free:latest"
@@ -54,7 +53,14 @@ def _decode(b):
 def run(cmd, check=True, capture_output=False, shell=False):
     try:
         if capture_output:
-            res = subprocess.run(cmd, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False, shell=shell)
+            res = subprocess.run(
+                cmd,
+                check=check,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                shell=shell,
+            )
             return res.returncode, _decode(res.stdout), _decode(res.stderr)
         else:
             res = subprocess.run(cmd, check=check, shell=shell)
@@ -154,16 +160,13 @@ def wait_db_ready(timeout_sec=600, sleep_sec=5):
 def ensure_directory_dp_dir():
     print("🛠️ Garantindo DIRECTORY dp_dir dentro do Oracle...")
     sql = f"""
+WHENEVER SQLERROR CONTINUE
 CREATE OR REPLACE DIRECTORY dp_dir AS '{CONTAINER_DPDUMP}';
 BEGIN
     EXECUTE IMMEDIATE 'GRANT READ, WRITE ON DIRECTORY dp_dir TO SYSTEM';
 EXCEPTION
     WHEN OTHERS THEN
-        IF SQLCODE = -1749 THEN
-            NULL; -- Ignora ORA-01749 (grant para si mesmo)
-        ELSE
-            RAISE;
-        END IF;
+        NULL;
 END;
 /
 """
@@ -227,20 +230,18 @@ def import_dump_if_needed(dump_filename: str, folder: Path) -> bool:
         f"directory=dp_dir dumpfile={dump_filename} logfile=import.log"
     )
 
-    cmd = f"""\
+    cmd = f"""
 set -e
-( {impdp_cmd} ) &
-pid=$!
+( {impdp_cmd} ) & pid=$!
 echo "📝 Acompanhando import.log (PID=$pid)..."
-for i in $(seq 1 120); do
+for i in $(seq 1 180); do
   [ -f {CONTAINER_DPDUMP}/import.log ] && break
   sleep 1
 done
 if tail --help 2>/dev/null | grep -q -- "--pid"; then
   tail -f {CONTAINER_DPDUMP}/import.log --pid $pid
 else
-  tail -f {CONTAINER_DPDUMP}/import.log &
-  t=$!
+  tail -f {CONTAINER_DPDUMP}/import.log & t=$!
   wait $pid || true
   kill $t 2>/dev/null || true
 fi
@@ -306,12 +307,37 @@ def setup_new_machine():
 
 def summarize_ora_errors(log_path: str, tail_lines: int = 50):
     print("🔎 Resumo dos erros ORA- no log:")
-    cmd_count = f"grep -o 'ORA-[0-9]\\\\+' {log_path} | sort | uniq -c | sort -nr | head -20"
+    cmd_count = f"grep -Eo 'ORA-[0-9]+' {log_path} | sort | uniq -c | sort -nr | head -20"
     _, out1, _ = exec_in_container(cmd_count)
     print(out1 or "(nenhum ORA- encontrado)")
     print("\n📝 Últimas linhas do log:")
     _, out2, _ = exec_in_container(f"tail -n {tail_lines} {log_path}")
     print(out2 or "(log vazio)")
+
+# [auto] Detecta schemas presentes no dump gerando um SQLFILE (não altera o BD)
+def detect_schemas_in_dump(dump_filename: str) -> list:
+    ddl_path = f"{CONTAINER_DPDUMP}/ddl_preview.sql"
+    log_path = f"{CONTAINER_DPDUMP}/diagnose_schema_detect.log"
+    exec_in_container(f"rm -f {ddl_path} {log_path}")
+    impdp_cmd = (
+        f"impdp system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} "
+        f"directory=dp_dir dumpfile={dump_filename} "
+        f"content=METADATA_ONLY sqlfile=ddl_preview.sql logfile=diagnose_schema_detect.log"
+    )
+    code, _, _ = exec_in_container(impdp_cmd)
+    if code != 0:
+        return []
+    extract_cmd = (
+        "grep -Eo 'CREATE (TABLE|VIEW|SEQUENCE|PROCEDURE|FUNCTION|PACKAGE|TRIGGER|INDEX) \"[^\"]+\"\\.\"' "
+        f"{ddl_path} | sed 's/.* \\\"\\([^\"]\\+\\)\\\"\\..*/\\1/' | sort | uniq -c | sort -nr"
+    )
+    _, out, _ = exec_in_container(extract_cmd)
+    schemas = []
+    for line in (out or "").splitlines():
+        parts = line.strip().split()
+        if parts:
+            schemas.append(parts[-1])
+    return schemas
 
 def recreate_user(user: str, password: str):
     sqlblock = f"""
@@ -332,6 +358,7 @@ GRANT CREATE VIEW, CREATE PROCEDURE, CREATE SEQUENCE, CREATE TRIGGER TO {user};
     else:
         print(f"✅ Usuário {user} (re)criado com sucesso.")
 
+# [auto] Executor do schema-only com possível fallback de ORA-39165
 def schema_only_import_fix(dump_filename: str, schema_src: str, user_dest: str, user_dest_pwd: str):
     print(f"📦 Import schema-only: dump={dump_filename}, schema_origem={schema_src}, destino={user_dest}")
     recreate_user(user_dest, user_dest_pwd)
@@ -339,40 +366,72 @@ def schema_only_import_fix(dump_filename: str, schema_src: str, user_dest: str, 
     log_path = f"{CONTAINER_DPDUMP}/import_schema.log"
     exec_in_container(f"rm -f {log_path}")
 
-    impdp_cmd = (
-        f"impdp system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} "
-        f"directory=dp_dir dumpfile={dump_filename} logfile=import_schema.log "
-        f"schemas={schema_src} remap_schema={schema_src}:{user_dest} "
-        f"transform=segment_attributes:n "
-        f"exclude=JOB,DB_LINK,SYNONYM,STATISTICS,GRANT"
-    )
-
-    cmd = f"""\
+    def _run_impdp(chosen_schema: str) -> int:
+        impdp_cmd = (
+            f"impdp system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE} "
+            f"directory=dp_dir dumpfile={dump_filename} logfile=import_schema.log "
+            f"schemas={chosen_schema} remap_schema={chosen_schema}:{user_dest} "
+            f"transform=segment_attributes:n "
+            f"exclude=JOB,DB_LINK,SYNONYM,STATISTICS,GRANT"
+        )
+        cmd = f"""
 set -e
-( {impdp_cmd} ) &
-pid=$!
+( {impdp_cmd} ) & pid=$!
 echo "📝 Acompanhando import_schema.log (PID=$pid)..."
-for i in $(seq 1 120); do
+for i in $(seq 1 180); do
   [ -f {log_path} ] && break
   sleep 1
 done
 if tail --help 2>/dev/null | grep -q -- "--pid"; then
   tail -f {log_path} --pid $pid
 else
-  tail -f {log_path} &
-  t=$!
+  tail -f {log_path} & t=$!
   wait $pid || true
   kill $t 2>/dev/null || true
 fi
 wait $pid
 """
-    code, out, err = exec_in_container(cmd)
+        code, _, _ = exec_in_container(cmd)
+        return code
+
+    # 1ª tentativa com o schema informado
+    code = _run_impdp(schema_src)
     summarize_ora_errors(log_path)
+
+    # [auto] Se ORA-39165 ocorreu, detecta schemas e tenta de novo com o mais provável
+    _, log_tail, _ = exec_in_container(f"tail -n 999 {log_path}")
+    if "ORA-39165" in (log_tail or ""):
+        print("⚠️ ORA-39165 detectado (schema inexistente no dump). Tentando detectar o schema correto...")
+        detected = detect_schemas_in_dump(dump_filename)
+        if detected:
+            best = detected[0]
+            if best.upper() != schema_src.upper():
+                print(f"🔎 Schema mais provável no dump: {best}. Nova tentativa automática...")
+                code = _run_impdp(best)
+                summarize_ora_errors(log_path)
+                if code == 0:
+                    print("✅ Import schema-only concluído após fallback automático.")
+                    _print_top_tables(user_dest)
+                    return True
+                else:
+                    print("❌ Import schema-only ainda falhou mesmo após fallback.")
+                    return False
+            else:
+                print("ℹ️ O schema detectado coincide com o informado; não há outro para tentar.")
+                return False
+        else:
+            print("❌ Não foi possível detectar schemas no dump. Verifique o arquivo .dmp.")
+            return False
+
     if code != 0:
         print("❌ Import schema-only terminou com erro (ver resumo acima).")
         return False
 
     print("✅ Import schema-only concluído.")
+    _print_top_tables(user_dest)
+    return True
+
+def _print_top_tables(user_dest: str):
     check_sql = f"""
 set pages 100 lines 200 feedback off
 SELECT table_name, num_rows FROM all_tables WHERE owner=upper('{user_dest}') ORDER BY num_rows DESC FETCH FIRST 20 ROWS ONLY;
@@ -380,7 +439,6 @@ SELECT table_name, num_rows FROM all_tables WHERE owner=upper('{user_dest}') ORD
     cmd = f'echo "{check_sql}" | sqlplus -s system/{ORACLE_PASSWORD}@localhost:{HOST_PORT_DB}/{ORACLE_SERVICE}'
     _, out, _ = exec_in_container(cmd)
     print("\n📊 Top 20 tabelas (num_rows):\n" + (out or "(sem retorno)"))
-    return True
 
 def diagnose_dump(dump_filename: str):
     print(f"🧪 Diagnóstico do dump: {dump_filename} (gerando DDL preview, sem alterar o banco)")
@@ -398,16 +456,16 @@ def diagnose_dump(dump_filename: str):
     print("📝 diagnose.log (últimas linhas):\n" + (tail_out or "(vazio)"))
 
     schema_extract = (
-        f"awk 'match($0, /CREATE (TABLE|VIEW|SEQUENCE|PROCEDURE|FUNCTION|PACKAGE|TRIGGER|INDEX) \\\"([^\\\"]+)\\\"\\./, m){{print m[2]}}' {ddl_path} "
-        "| sort | uniq -c | sort -nr | head -30"
+        "grep -Eo 'CREATE (TABLE|VIEW|SEQUENCE|PROCEDURE|FUNCTION|PACKAGE|TRIGGER|INDEX) \"[^\"]+\"\\.\"' "
+        f"{ddl_path} | sed 's/.* \\\"\\([^\"]\\+\\)\\\"\\..*/\\1/' | sort | uniq -c | sort -nr | head -30"
     )
     _, schemas_out, _ = exec_in_container(schema_extract)
 
-    tbs_extract = f"grep -o 'TABLESPACE \\\"[^\\\"]*\\\"' {ddl_path} | sed 's/TABLESPACE \\\"//;s/\\\"//' | sort | uniq -c | sort -nr"
+    tbs_extract = f"grep -Eo 'TABLESPACE \"[^\"]+\"' {ddl_path} | sed 's/TABLESPACE \\\"//;s/\\\"//' | sort | uniq -c | sort -nr"
     _, tbs_out, _ = exec_in_container(tbs_extract)
 
-    dblinks_extract = f"grep -o 'DATABASE LINK \\\"[^\\\"]*\\\"' {ddl_path} | sed 's/DATABASE LINK \\\"//;s/\\\"//' | sort | uniq -c | sort -nr"
-    _, dblink_out, _ = exec_in_container(dblinks_extract)
+    dblink_extract = f"grep -Eo 'DATABASE LINK \"[^\"]+\"' {ddl_path} | sed 's/DATABASE LINK \\\"//;s/\\\"//' | sort | uniq -c | sort -nr"
+    _, dblink_out, _ = exec_in_container(dblink_extract)
 
     print("\n📚 Schemas detectados no DDL (top 30 por ocorrência):")
     print(schemas_out or "(nenhum detectado)")
@@ -447,11 +505,11 @@ def menu():
 
     while True:
         print("\n=== MENU ORACLE 23c FREE ===")
-        print("[1] Fazer TUDO que é necessário sempre (subir/verificar Docker + DB, esperar ficar pronto, garantir DIRECTORY)")
-        print("[2] Importar DMP SOMENTE se mudou (caso necessário) — retorna ao menu ao terminar")
+        print("[1] Fazer TUDO que é necessário (verificar Docker/DB, esperar, garantir DIRECTORY)")
+        print("[2] Importar DMP SOMENTE se mudou (caso necessário)")
         print("[3] Setup de Docker/Imagem/Container (máquina nova)")
         print("[4] Encerrar serviços (parar container) e SAIR")
-        print("[5] Reimportar (schema-only) para corrigir erros comuns")
+        print("[5] Reimportar (schema-only) para corrigir erros comuns [com auto-detecção de schema]")
         print("[6] Diagnóstico do dump (DDL preview, schemas/tablespaces/links)")
         choice = input("Escolha: ").strip()
 
@@ -473,20 +531,16 @@ def menu():
 
         elif choice == "2":
             if not ensure_image(IMAGE):
-                input("Pressione ENTER para voltar ao menu...")
-                continue
+                input("Pressione ENTER para voltar ao menu..."); continue
             if not ensure_running():
-                input("Pressione ENTER para voltar ao menu...")
-                continue
+                input("Pressione ENTER para voltar ao menu..."); continue
             if not wait_db_ready():
-                input("Pressione ENTER para voltar ao menu...")
-                continue
+                input("Pressione ENTER para voltar ao menu..."); continue
             ensure_directory_dp_dir()
             dumps = list_dmp_files()
             if not dumps:
                 print(f"⚠️ Nenhum .DMP encontrado em {WIN_DMP_DIR}")
-                input("Pressione ENTER para voltar ao menu...")
-                continue
+                input("Pressione ENTER para voltar ao menu..."); continue
             if len(dumps) == 1:
                 dump = dumps[0]
                 print(f"ℹ️ Apenas um dump encontrado. Usando: {dump}")
@@ -499,9 +553,7 @@ def menu():
                     dump = dumps[int(sel)-1]
                 except Exception:
                     print("Opção inválida.")
-                    input("Pressione ENTER para voltar ao menu...")
-                    continue
-
+                    input("Pressione ENTER para voltar ao menu..."); continue
             try:
                 import_dump_if_needed(dump, dump_folder)
                 print_db_ready_banner()
@@ -522,6 +574,7 @@ def menu():
             break
 
         elif choice == "5":
+            # [auto] setup básico
             if not ensure_image(IMAGE):
                 input("Pressione ENTER para voltar ao menu..."); continue
             if not ensure_running():
@@ -529,6 +582,7 @@ def menu():
             if not wait_db_ready():
                 input("Pressione ENTER para voltar ao menu..."); continue
             ensure_directory_dp_dir()
+
             dumps = list_dmp_files()
             if not dumps:
                 print(f"⚠️ Nenhum .DMP encontrado em {WIN_DMP_DIR}")
@@ -546,7 +600,16 @@ def menu():
                 except Exception:
                     print("Opção inválida."); input("Pressione ENTER para voltar ao menu..."); continue
 
-            schema_src = input("Schema de ORIGEM (padrão: SKWCLOUD): ").strip() or "SKWCLOUD"
+            # [auto] detectar schemas e sugerir padrão
+            detected = detect_schemas_in_dump(dump)
+            default_schema = detected[0] if detected else "SKWCLOUD"
+            if detected:
+                print("🔎 Schemas detectados no dump (mais frequentes primeiro):", ", ".join(detected))
+            else:
+                print("⚠️ Não foi possível detectar schemas automaticamente; você pode digitar manualmente.")
+
+            # [auto] valores padrão solicitados
+            schema_src = input(f"Schema de ORIGEM (padrão: {default_schema}): ").strip() or default_schema
             user_dest = input("Usuário DESTINO (padrão: SKY_USER): ").strip() or "SKY_USER"
             user_dest_pwd = input(f"Senha do usuário {user_dest} (padrão: MinhaSenha!1): ").strip() or "MinhaSenha!1"
 
